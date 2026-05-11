@@ -201,6 +201,108 @@ function printTweets(
   }
 }
 
+function renderArticleContent(tweet: TweetData): string {
+  const article = tweet.article;
+  if (!article) return '';
+
+  const lines: string[] = [];
+  lines.push('');
+  lines.push('📄 ' + article.title);
+
+  if (article.coverImageUrl) {
+    lines.push(`🖼️ ${article.coverImageUrl}`);
+  }
+
+  if (article.summaryText) {
+    lines.push('');
+    lines.push('📋 Summary:');
+    lines.push(article.summaryText);
+  }
+
+  if (article.contentBlocks && article.entities) {
+    const entityMap = new Map(article.entities.map((e) => [e.key, e.value]));
+
+    lines.push('');
+    lines.push('─'.repeat(60));
+
+    for (const block of article.contentBlocks) {
+      if (block.type === 'atomic') {
+        // Atomic blocks reference media entities via entityRanges
+        for (const range of block.entityRanges) {
+          const entity = entityMap.get(String(range.key));
+          if (entity?.type === 'MEDIA') {
+            const mediaId = entity.data.mediaItems[0]?.mediaId;
+            const mediaEntity = article.mediaEntities?.find((m) => m.mediaId === mediaId);
+            if (mediaEntity?.imageUrl) {
+              lines.push(`[img: ${mediaEntity.imageUrl}]`);
+            }
+          }
+        }
+        continue;
+      }
+
+      let text = block.text;
+      if (!text) continue;
+
+      // Apply entity replacements (links, markdown, media)
+      for (const range of block.entityRanges) {
+        const entity = entityMap.get(String(range.key));
+        if (!entity) continue;
+
+        if (entity.type === 'LINK' && entity.data.url) {
+          // Replace text at offset with markdown link
+          const before = text.slice(0, range.offset);
+          const after = text.slice(range.offset + range.length);
+          text = before + entity.data.url + after;
+        }
+
+        if (entity.type === 'MARKDOWN' && entity.data.markdown) {
+          text = entity.data.markdown;
+        }
+      }
+
+      // Format based on block type
+      switch (block.type) {
+        case 'header-one':
+          lines.push('');
+          lines.push('▓ ' + text.toUpperCase());
+          lines.push('');
+          break;
+        case 'header-two':
+          lines.push('');
+          lines.push('▌ ' + text);
+          lines.push('');
+          break;
+        case 'header-three':
+          lines.push('  ' + text);
+          break;
+        case 'blockquote':
+          lines.push('│ ' + text);
+          break;
+        case 'unordered-list-item':
+          lines.push('  • ' + text);
+          break;
+        case 'ordered-list-item':
+          lines.push('  1. ' + text);
+          break;
+        case 'unstyled':
+        default:
+          lines.push(text);
+          break;
+      }
+    }
+  }
+
+  if (article.previewText && !article.contentBlocks) {
+    lines.push('');
+    lines.push(article.previewText + '…');
+    lines.push('');
+    lines.push('Use --article to fetch the full content.');
+  }
+
+  return lines.join('\n');
+}
+
 // Tweet command
 program
   .command('tweet')
@@ -442,10 +544,11 @@ program
 // Read command - fetch tweet content
 program
   .command('read')
-  .description('Read/fetch a tweet by ID or URL')
+  .description('Read/fetch a tweet by ID or URL (use --article for full article content)')
   .argument('<tweet-id-or-url>', 'Tweet ID or URL to read')
   .option('--json', 'Output as JSON')
-  .action(async (tweetIdOrUrl: string, cmdOpts: { json?: boolean }) => {
+  .option('--article', 'Fetch full article content for X Articles')
+  .action(async (tweetIdOrUrl: string, cmdOpts: { json?: boolean; article?: boolean }) => {
     const opts = program.opts();
     const sweetistics = resolveSweetisticsConfig({
       sweetisticsApiKey: opts.sweetisticsApiKey || config.sweetisticsApiKey,
@@ -500,7 +603,8 @@ program
     }
 
     const client = new TwitterClient({ cookies });
-    const result = await client.getTweet(tweetId);
+    const useArticle = cmdOpts.article;
+    const result = useArticle ? await client.getArticle(tweetId) : await client.getTweet(tweetId);
 
     if (result.success && result.tweet) {
       if (cmdOpts.json) {
@@ -514,6 +618,11 @@ program
         console.log(
           `❤️ ${result.tweet.likeCount ?? 0}  🔁 ${result.tweet.retweetCount ?? 0}  💬 ${result.tweet.replyCount ?? 0}`,
         );
+
+        // Display article info if present
+        if (result.tweet.article) {
+          console.log(renderArticleContent(result.tweet));
+        }
       }
     } else if (sweetistics.apiKey) {
       console.error(`⚠️ GraphQL read failed (${result.error}); trying Sweetistics fallback...`);

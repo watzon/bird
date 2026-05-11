@@ -16,6 +16,7 @@ const FALLBACK_QUERY_IDS = {
   FavoriteTweet: 'lI07N6Otwv1PhnEgXILM7A',
   TweetDetail: 'nBS-WpgA6ZG0CyNHD517JQ',
   SearchTimeline: 'Tp1sewRU1AsZpBWhqCZicQ',
+  TweetResultByRestId: 'uEyKTt72BfzaY84WLGC5Dw',
 } as const;
 
 type OperationName = keyof typeof FALLBACK_QUERY_IDS;
@@ -43,10 +44,109 @@ type GraphqlTweetResult = {
           screen_name?: string;
           name?: string;
         };
+        core?: {
+          screen_name?: string;
+          name?: string;
+          created_at?: string;
+        };
+      };
+    };
+  };
+  article?: {
+    article_results?: {
+      result?: {
+        rest_id?: string;
+        title?: string;
+        preview_text?: string;
+        summary_text?: string;
+        cover_media?: {
+          media_id?: string;
+          media_info?: {
+            original_img_url?: string;
+            original_img_height?: number;
+            original_img_width?: number;
+          };
+        };
+        content_state?: ArticleContentState;
+        media_entities?: Array<{
+          media_id?: string;
+          media_info?: {
+            original_img_url?: string;
+            original_img_height?: number;
+            original_img_width?: number;
+          };
+        }>;
       };
     };
   };
 };
+
+// --- X Article types ---
+
+interface ArticleInlineStyleRange {
+  offset: number;
+  length: number;
+  style: string;
+}
+
+interface ArticleEntityRange {
+  key: number;
+  offset: number;
+  length: number;
+}
+
+interface ArticleBlock {
+  key: string;
+  text: string;
+  type: 'unstyled' | 'header-one' | 'header-two' | 'header-three' | 'atomic' | 'blockquote' | 'unordered-list-item' | 'ordered-list-item' | 'code-block';
+  inlineStyleRanges: ArticleInlineStyleRange[];
+  entityRanges: ArticleEntityRange[];
+  data: Record<string, unknown>;
+}
+
+interface ArticleMarkdownEntity {
+  type: 'MARKDOWN';
+  mutability: 'Mutable';
+  data: { markdown: string };
+}
+
+interface ArticleMediaEntity {
+  type: 'MEDIA';
+  mutability: 'Immutable';
+  data: {
+    entityKey: string;
+    mediaItems: Array<{ localMediaId: string; mediaCategory: string; mediaId: string }>;
+  };
+}
+
+interface ArticleLinkEntity {
+  type: 'LINK';
+  mutability: 'Mutable';
+  data: { url: string };
+}
+
+type ArticleEntity = ArticleMarkdownEntity | ArticleMediaEntity | ArticleLinkEntity;
+
+interface ArticleContentState {
+  blocks: ArticleBlock[];
+  entityMap: Array<{ key: string; value: ArticleEntity }>;
+}
+
+export interface ArticleData {
+  restId: string;
+  title: string;
+  previewText?: string;
+  summaryText?: string;
+  coverImageUrl?: string;
+  contentBlocks?: ArticleBlock[];
+  entities?: Array<{ key: string; value: ArticleEntity }>;
+  mediaEntities?: Array<{
+    mediaId: string;
+    imageUrl: string;
+    width: number;
+    height: number;
+  }>;
+}
 
 export interface TweetResult {
   success: boolean;
@@ -67,6 +167,7 @@ export interface TweetData {
   likeCount?: number;
   conversationId?: string;
   inReplyToStatusId?: string;
+  article?: ArticleData;
 }
 
 export interface GetTweetResult {
@@ -194,7 +295,35 @@ export class TwitterClient {
   }
 
   private mapTweetResult(result: GraphqlTweetResult | undefined): TweetData | undefined {
-    if (!result?.legacy || !result.core?.user_results?.result?.legacy?.screen_name) return undefined;
+    if (!result?.legacy) return undefined;
+
+    // Extract user info — TweetDetail puts screen_name in user.legacy,
+    // TweetResultByRestId puts it in user.core
+    const userResult = result.core?.user_results?.result;
+    const username = userResult?.legacy?.screen_name ?? userResult?.core?.screen_name ?? '';
+    const name = userResult?.legacy?.name ?? userResult?.core?.name ?? username;
+    if (!username) return undefined;
+
+    // Extract article metadata if present
+    let article: ArticleData | undefined;
+    const articleResult = result.article?.article_results?.result;
+    if (articleResult?.rest_id && articleResult?.title) {
+      article = {
+        restId: articleResult.rest_id,
+        title: articleResult.title,
+        previewText: articleResult.preview_text,
+        summaryText: articleResult.summary_text,
+        coverImageUrl: articleResult.cover_media?.media_info?.original_img_url,
+        contentBlocks: articleResult.content_state?.blocks,
+        entities: articleResult.content_state?.entityMap,
+        mediaEntities: articleResult.media_entities?.map((m) => ({
+          mediaId: m.media_id ?? '',
+          imageUrl: m.media_info?.original_img_url ?? '',
+          width: m.media_info?.original_img_width ?? 0,
+          height: m.media_info?.original_img_height ?? 0,
+        })),
+      };
+    }
     return {
       id: result.rest_id || '',
       text: result.legacy.full_text || '',
@@ -205,9 +334,10 @@ export class TwitterClient {
       conversationId: result.legacy.conversation_id_str,
       inReplyToStatusId: result.legacy.in_reply_to_status_id_str ?? undefined,
       author: {
-        username: result.core.user_results.result.legacy.screen_name,
-        name: result.core.user_results.result.legacy.name || result.core.user_results.result.legacy.screen_name,
+        username,
+        name,
       },
+      article,
     };
   }
 
@@ -377,6 +507,104 @@ export class TwitterClient {
       return { success: true, tweet: mapped };
     }
     return { success: false, error: 'Tweet not found in response' };
+  }
+
+  /**
+   * Get tweet with full article content via TweetResultByRestId
+   */
+  async getArticle(tweetId: string): Promise<GetTweetResult> {
+    const variables = {
+      tweetId,
+      withCommunity: false,
+      includePromotedContent: false,
+      withVoice: false,
+    };
+
+    const features = {
+      creator_subscriptions_tweet_preview_api_enabled: true,
+      premium_content_api_read_enabled: false,
+      communities_web_enable_tweet_community_results_fetch: true,
+      c9s_tweet_anatomy_moderator_badge_enabled: true,
+      responsive_web_grok_analyze_button_fetch_trends_enabled: false,
+      responsive_web_grok_analyze_post_followups_enabled: false,
+      rweb_video_screen_enabled: false,
+      rweb_cashtags_composer_attachment_enabled: true,
+      responsive_web_jetfuel_frame: true,
+      responsive_web_grok_share_attachment_enabled: true,
+      responsive_web_grok_annotations_enabled: true,
+      articles_preview_enabled: true,
+      responsive_web_edit_tweet_api_enabled: true,
+      graphql_is_translatable_rweb_tweet_is_translatable_enabled: true,
+      view_counts_everywhere_api_enabled: true,
+      longform_notetweets_consumption_enabled: true,
+      responsive_web_twitter_article_tweet_consumption_enabled: true,
+      freedom_of_speech_not_reach_fetch_enabled: true,
+      standardized_nudges_misinfo: true,
+      tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled: true,
+      longform_notetweets_rich_text_read_enabled: true,
+      longform_notetweets_inline_media_enabled: false,
+      profile_label_improvements_pcf_label_in_post_enabled: true,
+      responsive_web_graphql_skip_user_profile_image_extensions_enabled: false,
+      responsive_web_graphql_timeline_navigation_enabled: true,
+      responsive_web_grok_image_annotation_enabled: true,
+      responsive_web_grok_imagine_annotation_enabled: true,
+    };
+
+    const fieldToggles = {
+      withArticleRichContentState: true,
+      withArticlePlainText: false,
+      withArticleSummaryText: true,
+      withArticleVoiceOver: true,
+      withGrokAnalyze: false,
+      withDisallowedReplyControls: false,
+    };
+
+    const params = new URLSearchParams({
+      variables: JSON.stringify(variables),
+      features: JSON.stringify(features),
+      fieldToggles: JSON.stringify(fieldToggles),
+    });
+
+    const url = `${TWITTER_API_BASE}/${QUERY_IDS.TweetResultByRestId}/TweetResultByRestId?${params}`;
+
+    try {
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: this.getHeaders(),
+      });
+
+      if (!response.ok) {
+        const text = await response.text();
+        return { success: false, error: `HTTP ${response.status}: ${text.slice(0, 200)}` };
+      }
+
+      const data = (await response.json()) as {
+        data?: {
+          tweetResult?: { result?: GraphqlTweetResult };
+        };
+        errors?: Array<{ message: string; code?: number }>;
+      };
+
+      if (data.errors && data.errors.length > 0) {
+        return { success: false, error: data.errors.map((e) => e.message).join(', ') };
+      }
+
+      if (!data.data) {
+        return { success: false, error: 'No data in TweetResultByRestId response' };
+      }
+
+      const tweetResult = data.data.tweetResult?.result;
+      if (!tweetResult) {
+        return { success: false, error: 'Tweet not found in response' };
+      }
+
+      const mapped = this.mapTweetResult(tweetResult);
+      return mapped
+        ? { success: true, tweet: mapped }
+        : { success: false, error: 'Tweet not found in response' };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
   }
 
   /**
